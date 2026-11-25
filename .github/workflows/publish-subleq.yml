@@ -1,0 +1,85 @@
+name: Publish SUBLEQ QEMU
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  binary:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3 python3-venv ninja-build meson pkg-config libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
+      - name: Compile from checked-in audited source (no network downloads)
+        run: |
+          mkdir build
+          cd build
+          ../configure --target-list=subleq-softmmu --without-default-features --enable-tcg --enable-slirp --enable-fdt=system --disable-docs --disable-download
+          ninja -j2 qemu-system-subleq
+          ./qemu-system-subleq --help | grep -F 'https://github.com/danosito/qemu-system-subleq'
+          ./qemu-system-subleq -machine help | grep -F esi
+          file qemu-system-subleq
+          ldd qemu-system-subleq
+          mkdir -p ../dist
+          cp qemu-system-subleq ../dist/qemu-system-subleq-linux-${{ matrix.arch }}
+          (cd ../dist && sha256sum qemu-system-subleq-linux-${{ matrix.arch }} > qemu-system-subleq-linux-${{ matrix.arch }}.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+  publish:
+    needs: binary
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      - name: Verify both release checksums and prepare minimal image context
+        run: |
+          cd dist
+          sha256sum -c *.sha256
+          cd ..
+          mkdir -p packaging/binaries/{amd64,arm64}
+          cp dist/qemu-system-subleq-linux-amd64 packaging/binaries/amd64/qemu-system-subleq
+          cp dist/qemu-system-subleq-linux-arm64 packaging/binaries/arm64/qemu-system-subleq
+      - name: Publish release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --title "SUBLEQ QEMU ${GITHUB_REF_NAME}" --notes "QEMU SUBLEQ target and ESI machine. Standalone Linux amd64/arm64 binaries (dynamically linked); source is the tagged repository. No guest ROM or disk is distributed."
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and publish both architectures
+        uses: docker/build-push-action@v6
+        with:
+          context: packaging
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/danosito/qemu-system-subleq:${{ github.ref_name }}
+            ghcr.io/danosito/qemu-system-subleq:latest
+          provenance: false

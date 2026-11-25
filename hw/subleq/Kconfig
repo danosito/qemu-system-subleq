@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+config ESI
+    bool
+    default y
+    depends on SUBLEQ
+    select VIRTIO_MMIO
+    select VIRTIO_BLK
+    select VIRTIO_NET
+    select VIRTIO_RNG
