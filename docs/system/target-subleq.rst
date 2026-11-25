@@ -70,9 +70,11 @@ Experimental virtio-mmio
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``-M esi,x-virtio-mmio=on`` adds three standard modern (version 2)
-virtio-mmio transports. This option defaults to off and does not modify
-how ``-kernel`` or ``-bios`` loads an image. No block or network device
-is auto-created. Use an explicit ``bus=`` to place each device:
+virtio-mmio transports; ``x-tools-disk=on`` additionally enables a fourth
+block-only slot and requires ``x-virtio-mmio=on``. Both options default to off
+and do not modify how ``-kernel`` or ``-bios`` loads an image. No block,
+network or RNG device is auto-created. Use an explicit ``bus=`` to place
+each device:
 
 .. list-table::
    :header-rows: 1
@@ -90,9 +92,13 @@ is auto-created. Use an explicit ``bus=`` to place each device:
      - ``0x60001000``
      - ``0x61001000``
    * - ``virtio-mmio-bus.2``
-     - Optional second ``virtio-net-device``
+     - ``virtio-rng-device`` (explicit Linux ``rng-random`` backend) or optional second ``virtio-net-device``
      - ``0x60002000``
      - ``0x61002000``
+   * - ``virtio-mmio-bus.3`` (requires ``x-tools-disk=on``)
+     - ``virtio-blk-device`` only
+     - ``0x60003000``
+     - ``0x61003000``
 
 Each window is 4 KiB. The read window exposes the standard register and
 configuration offsets; a transport without a device reports device ID
@@ -120,12 +126,16 @@ network backend to a direct-boot capsule:
        -netdev user,id=n0,restrict=on \
        -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1,mac=52:54:00:12:34:56
 
-These slots support only QEMU's userspace ``virtio-blk-device`` and
-``virtio-net-device``. The NIC can use ordinary userspace networking, for
+The first three slots support QEMU's userspace ``virtio-blk-device`` and
+``virtio-net-device``; slot 2 also supports ``virtio-rng-device`` with an
+explicit ready Linux ``rng-random`` backend. The optional fourth slot is
+block-only. The NIC can use ordinary userspace networking, for
 example ``user`` or ``tap`` with ``vhost=off``. Backends that can activate
 vhost, including vhost-user, vhost-vDPA and reconnectable passt, are not
 supported. The ESI slots reject them, other virtio frontend types and
-``iommu_platform=on`` at plug time.
+``iommu_platform=on`` at plug time. ``x-idle-wakeup-v1=on`` enables a
+board idle-wakeup protocol and ``x-idle-tick-coalesce-50ms=on`` enables
+idle tick coalescing; see ``-machine esi,help`` for available options.
 
 Virtqueue rings and buffers on these slots use a separate DMA address space
 mapping only guest RAM at ``0x00000000`` through ``0x5fffffff``, inclusive.

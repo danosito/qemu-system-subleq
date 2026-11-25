@@ -62,6 +62,11 @@ jobs:
           mkdir -p packaging/binaries/{amd64,arm64}
           cp dist/qemu-system-subleq-linux-amd64 packaging/binaries/amd64/qemu-system-subleq
           cp dist/qemu-system-subleq-linux-arm64 packaging/binaries/arm64/qemu-system-subleq
+          mkdir -p packaging/licenses
+          cp LICENSE COPYING COPYING.LIB packaging/licenses/
+          cp subprojects/berkeley-softfloat-3/COPYING.txt packaging/licenses/softfloat-COPYING.txt
+          cp subprojects/berkeley-testfloat-3/COPYING.txt packaging/licenses/testfloat-COPYING.txt
+          cp subprojects/keycodemapdb/LICENSE.* packaging/licenses/
       - name: Publish release binaries
         env:
           GH_TOKEN: ${{ github.token }}
