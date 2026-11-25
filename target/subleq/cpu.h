@@ -58,6 +58,9 @@ struct ArchCPU {
     uint64_t idle_virtio_wakes;
     bool ram_burst;
     bool direct_c_link;
+    bool compact_tb;
+    bool ordered_read_pair;
+    bool compact_tcg;
     bool retranslation_helper;
     /* Translation policy only; not guest CPU state. */
     uint32_t translated_run_start;

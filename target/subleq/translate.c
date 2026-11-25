@@ -19,6 +19,10 @@
 typedef struct SubleqDisasContext {
     DisasContextBase base;
     unsigned burst_len;
+    unsigned compact_len;
+    TCGLabel *compact_exit;
+    bool direct_c_link;
+    bool ordered_read_pair;
     uint32_t words[SUBLEQ_BURST_INSNS][3];
 } SubleqDisasContext;
 
@@ -58,7 +62,7 @@ static TCGv_i32 subleq_gen_ram_operand(uint32_t pc, TCGLabel *slow)
 }
 
 static void subleq_gen_ram_step(uint32_t pc, TCGv_i32 a, TCGv_i32 b,
-                                TCGv_i32 c, TCGLabel *slow)
+                                TCGv_i32 c, TCGLabel *slow, bool short_timer)
 {
     TCGv_i32 val = tcg_temp_new_i32();
     TCGv_i32 result = tcg_temp_new_i32();
@@ -81,13 +85,22 @@ static void subleq_gen_ram_step(uint32_t pc, TCGv_i32 a, TCGv_i32 b,
     tcg_gen_qemu_ld_i32(handler, tcg_constant_tl(SUBLEQ_IRQ_HANDLER),
                         0, MO_LEUL | MO_ALIGN);
     tcg_gen_brcondi_i32(TCG_COND_EQ, handler, 0, done);
-    tcg_gen_ld_i32(timer, tcg_env, offsetof(CPUSubleqState, timer));
-    tcg_gen_addi_i32(val, timer, 1);
-    tcg_gen_st_i32(val, tcg_env, offsetof(CPUSubleqState, timer));
-    tcg_gen_brcondi_i32(TCG_COND_LEU, timer, SUBLEQ_TIMER_THRESHOLD, done);
-    gen_helper_subleq_timer_irq(next, tcg_env, next, handler);
-    gen_set_label(done);
-    tcg_gen_st_i32(next, tcg_env, offsetof(CPUSubleqState, pc));
+    if (short_timer) {
+        TCGLabel *exit = gen_new_label();
+        gen_helper_subleq_burst_tick(tcg_env, next, handler);
+        tcg_gen_br(exit);
+        gen_set_label(done);
+        tcg_gen_st_i32(next, tcg_env, offsetof(CPUSubleqState, pc));
+        gen_set_label(exit);
+    } else {
+        tcg_gen_ld_i32(timer, tcg_env, offsetof(CPUSubleqState, timer));
+        tcg_gen_addi_i32(val, timer, 1);
+        tcg_gen_st_i32(val, tcg_env, offsetof(CPUSubleqState, timer));
+        tcg_gen_brcondi_i32(TCG_COND_LEU, timer, SUBLEQ_TIMER_THRESHOLD, done);
+        gen_helper_subleq_timer_irq(next, tcg_env, next, handler);
+        gen_set_label(done);
+        tcg_gen_st_i32(next, tcg_env, offsetof(CPUSubleqState, pc));
+    }
 }
 
 static bool subleq_decode_ram_triple(DisasContextBase *db, CPUState *cs,
@@ -134,7 +147,7 @@ static bool subleq_use_retranslation_helper(DisasContextBase *db,
     SubleqTBHistory *entry;
 
     /* Debug and forced single-instruction replays do not train this policy. */
-    if (!cpu->retranslation_helper ||
+    if (!cpu->retranslation_helper || cpu->compact_tb ||
         (tb_cflags(db->tb) & (CF_NO_GOTO_TB | CF_NOIRQ | CF_COUNT_MASK))) {
         return false;
     }
@@ -156,33 +169,43 @@ static bool subleq_use_retranslation_helper(DisasContextBase *db,
  * triple still gets QEMU's insn_start, restore point and tracked code bytes.
  * Only a final instruction may transfer control non-sequentially.
  */
-static unsigned subleq_plan_burst(SubleqDisasContext *dc, CPUState *cs)
+static unsigned subleq_plan_burst(SubleqDisasContext *dc, CPUState *cs,
+                                  bool compact)
 {
     DisasContextBase *db = &dc->base;
     vaddr pc = db->pc_first;
     unsigned n = 0;
+    bool rom = compact && pc <= UINT32_MAX &&
+               subleq_in_rom(SUBLEQ_CPU(cs), pc, SUBLEQ_INSN_SIZE);
 
     if (!db->host_addr[0] || db->plugin_enabled || (pc & 3) ||
-        SUBLEQ_CPU(cs)->retranslation_helper ||
+        (compact ? (tb_cflags(db->tb) & ~CF_CLUSTER_MASK) != 0 :
+         SUBLEQ_CPU(cs)->retranslation_helper) ||
         (tb_cflags(db->tb) & (CF_COUNT_MASK | CF_SINGLE_STEP | CF_BP_PAGE |
                               CF_NO_GOTO_TB | CF_NO_GOTO_PTR | CF_USE_ICOUNT |
                               CF_NOIRQ | CF_MEMI_ONLY))) {
         return 0;
     }
     while (n < MIN(SUBLEQ_BURST_INSNS, db->max_insns) &&
-           pc <= SUBLEQ_RAM_SIZE - SUBLEQ_INSN_SIZE &&
+           (pc <= SUBLEQ_RAM_SIZE - SUBLEQ_INSN_SIZE ||
+            (rom && subleq_in_rom(SUBLEQ_CPU(cs), pc, SUBLEQ_INSN_SIZE))) &&
            translator_is_same_page(db, pc + SUBLEQ_INSN_SIZE - 1)) {
         uint32_t *words = dc->words[n];
         for (int i = 0; i < 3; i++) {
             uint32_t raw = translator_ldl_end(cpu_env(cs), db, pc + i * 4,
                                               MO_LE);
-            if ((raw & 1) || raw >= SUBLEQ_RAM_SIZE) {
+            /* Only C is control, never a data pointer. ROM code fetch is
+             * tracked like RAM; MMIO, indirects, ROM data and stores to ROM
+             * remain on the unmodified reference path. */
+            if ((raw & 1) || (raw >= SUBLEQ_RAM_SIZE &&
+                !(rom && i == 2 && subleq_in_rom(SUBLEQ_CPU(cs), raw & -4u,
+                                                 SUBLEQ_INSN_SIZE)))) {
                 return n;
             }
             words[i] = raw & -4u;
         }
         if (words[0] == SUBLEQ_CLOCK || !words[2] ||
-            words[1] < TARGET_PAGE_SIZE ||
+            (!compact && words[1] < TARGET_PAGE_SIZE) ||
             translator_is_same_page(db, words[1])) {
             break;
         }
@@ -280,12 +303,80 @@ static void subleq_gen_guarded_slot1(DisasContextBase *db, uint32_t dest)
     gen_set_label(miss);
 }
 
+/* A compact region amortizes the TB header, fallback and dispatcher across
+ * ordinary direct triples. No guest accesses are fused: the same checked
+ * helpers commit each instruction and tick, with their own restore point. */
+static void subleq_compact_body(uint32_t pc, const uint32_t words[3], bool pair)
+{
+    if ((words[0] | words[1]) < 4096 &&
+        (words[2] & -4u) == pc + SUBLEQ_INSN_SIZE) {
+        uint32_t ab = (words[0] & 0xffc) | ((words[1] & 0xffc) << 12);
+        (pair ? gen_helper_subleq_compact_pair_low_seq :
+                gen_helper_subleq_compact_low_seq)(tcg_env, tcg_constant_i32(ab),
+            tcg_constant_i32(pc + SUBLEQ_INSN_SIZE));
+    } else {
+        (pair ? gen_helper_subleq_compact_pair : gen_helper_subleq_compact)(
+            tcg_env, tcg_constant_i32(words[0] & -4u),
+            tcg_constant_i32(words[1] & -4u), tcg_constant_i32(words[2] & -4u),
+            tcg_constant_i32(pc));
+    }
+}
+
+static void subleq_compact_region_insn(SubleqDisasContext *dc)
+{
+    DisasContextBase *db = &dc->base;
+    uint32_t *words = dc->words[db->num_insns - 1];
+    ptrdiff_t off = offsetof(CPUState, watchpoints.tqh_first) -
+                    (ptrdiff_t)offsetof(SubleqCPU, env);
+    TCGv_ptr wp = tcg_temp_new_ptr();
+
+    tcg_gen_ld_ptr(wp, tcg_env, off);
+    if (db->num_insns == 1) {
+        TCGLabel *fast = gen_new_label();
+        dc->compact_exit = gen_new_label();
+        tcg_gen_brcondi_ptr(TCG_COND_EQ, wp, 0, fast);
+        gen_helper_subleq_step(tcg_env);
+        tcg_gen_br(dc->compact_exit);
+        gen_set_label(fast);
+    } else {
+        TCGv_i32 flags = tcg_temp_new_i32();
+        TCGv_i32 pc = tcg_temp_new_i32();
+        tcg_gen_brcondi_ptr(TCG_COND_NE, wp, 0, dc->compact_exit);
+        tcg_gen_ld_i32(pc, tcg_env, offsetof(CPUSubleqState, pc));
+        tcg_gen_brcondi_i32(TCG_COND_NE, pc, db->pc_next, dc->compact_exit);
+        /* Recheck against DMA/code invalidation before executing the suffix. */
+        tcg_gen_ld_i32(flags, tcg_constant_ptr(db->tb),
+                       offsetof(TranslationBlock, cflags));
+        tcg_gen_brcondi_i32(TCG_COND_TSTNE, flags, CF_INVALID, dc->compact_exit);
+    }
+    subleq_compact_body(db->pc_next, words, dc->ordered_read_pair);
+    db->pc_next += SUBLEQ_INSN_SIZE;
+    if (db->num_insns == dc->compact_len) {
+        if (words[2] != db->pc_next && translator_use_goto_tb(db, words[2]) &&
+            dc->direct_c_link) {
+            subleq_gen_guarded_slot1(db, words[2]);
+        }
+        db->is_jmp = DISAS_TOO_MANY;
+    }
+}
+
 static void subleq_tr_translate_insn(DisasContextBase *db, CPUState *cs)
 {
     vaddr pc = db->pc_next;
     SubleqDisasContext *dc = container_of(db, SubleqDisasContext, base);
     if (db->num_insns == 1 && SUBLEQ_CPU(cs)->ram_burst) {
-        dc->burst_len = subleq_plan_burst(dc, cs);
+        dc->burst_len = subleq_plan_burst(dc, cs, false);
+    } else if (db->num_insns == 1 && SUBLEQ_CPU(cs)->compact_tb) {
+        dc->direct_c_link = SUBLEQ_CPU(cs)->direct_c_link;
+#if defined(__x86_64__)
+        dc->ordered_read_pair = SUBLEQ_CPU(cs)->ordered_read_pair &&
+            !(tb_cflags(db->tb) & ~CF_CLUSTER_MASK) && !db->plugin_enabled;
+#endif
+        dc->compact_len = subleq_plan_burst(dc, cs, true);
+    }
+    if (dc->compact_len >= 2 || (dc->compact_len && pc >= SUBLEQ_RAM_SIZE)) {
+        subleq_compact_region_insn(dc);
+        return;
     }
     if (dc->burst_len >= 2) {
         subleq_gen_burst_insn(dc);
@@ -295,6 +386,7 @@ static void subleq_tr_translate_insn(DisasContextBase *db, CPUState *cs)
     bool retranslated = ram_insn && subleq_use_retranslation_helper(db, cs, pc);
     SubleqCPU *cpu = SUBLEQ_CPU(cs);
     bool predict_backedge = false;
+    bool compact = false;
 
     /* Translation order supplies a hint, never an architectural target. */
     if (pc != cpu->translated_run_next ||
@@ -336,15 +428,27 @@ static void subleq_tr_translate_insn(DisasContextBase *db, CPUState *cs)
                     direct_target = dest;
                 }
             }
-            a = subleq_gen_decoded_operand(words[0], slow);
-            b = subleq_gen_decoded_operand(words[1], slow);
-            c = subleq_gen_decoded_operand(words[2], slow);
+            /* Keep every instruction's tracked fetch/restore point, but move
+             * the checked ordinary RAM operation into one shared C body. */
+            compact = cpu->compact_tb && !(words[0] & 1) &&
+                !(words[1] & 1) && !(words[2] & 1) &&
+                (words[0] & -4u) != SUBLEQ_CLOCK &&
+                (words[2] & -4u) != 0;
+            if (!compact) {
+                a = subleq_gen_decoded_operand(words[0], slow);
+                b = subleq_gen_decoded_operand(words[1], slow);
+                c = subleq_gen_decoded_operand(words[2], slow);
+            }
         } else {
             a = subleq_gen_ram_operand(pc, slow);
             b = subleq_gen_ram_operand(pc + 4, slow);
             c = subleq_gen_ram_operand(pc + 8, slow);
         }
-        subleq_gen_ram_step(pc, a, b, c, slow);
+        if (compact) {
+            subleq_compact_body(pc, words, dc->ordered_read_pair);
+        } else {
+            subleq_gen_ram_step(pc, a, b, c, slow, cpu->compact_tcg);
+        }
         if (direct_target) {
             /* The full-step fallback (including watchpoints) skips this edge. */
             subleq_gen_guarded_slot1(db, direct_target);
@@ -365,6 +469,8 @@ static void subleq_tr_translate_insn(DisasContextBase *db, CPUState *cs)
 
 static void subleq_tr_tb_stop(DisasContextBase *db, CPUState *cs)
 {
+    SubleqDisasContext *dc = container_of(db, SubleqDisasContext, base);
+
     if (db->is_jmp == DISAS_BURST_DONE) {
         return;
     }
@@ -381,6 +487,10 @@ static void subleq_tr_tb_stop(DisasContextBase *db, CPUState *cs)
         gen_set_label(other);
     }
     tcg_gen_lookup_and_goto_ptr();
+    if (dc->compact_exit) {
+        gen_set_label(dc->compact_exit);
+        tcg_gen_exit_tb(NULL, 0);
+    }
 }
 
 static const TranslatorOps subleq_tr_ops = {

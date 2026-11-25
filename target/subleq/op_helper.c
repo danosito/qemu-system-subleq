@@ -5,6 +5,8 @@
 #include "qemu/timer.h"
 #include "cpu.h"
 #include "accel/tcg/cpu-ldst.h"
+#include "exec/target_page.h"
+#include "qemu/atomic.h"
 #include "exec/cpu-common.h"
 #include "exec/helper-proto.h"
 #include "exec/translation-block.h"
@@ -166,6 +168,143 @@ void HELPER(subleq_burst_tick)(CPUSubleqState *env, uint32_t pc,
         pc = subleq_timer_irq(env, pc, handler, GETPC());
     }
     env->pc = pc;
+}
+
+/* Mirror the TCG qemu_ld/st direct-hit test: equality rejects MMIO,
+ * watchpoints, write-to-clean-code (NOTDIRTY), and all FORCE_SLOW flags.
+ * Every call takes a fresh TLB entry: a prior access or interrupt may have
+ * invalidated the page or TLB. A miss goes through the normal checked MMU
+ * routine with the helper's GETPC as the restore address. */
+static inline uint32_t subleq_compact_load(CPUSubleqState *env, uint32_t addr,
+                                           uintptr_t ra, bool after_ram_read,
+                                           bool *was_ram_read)
+{
+    CPUState *cs = env_cpu(env);
+    CPUTLBDescFast *fast = cpu_tlb_fast(cs, 0);
+    CPUTLBEntry *entry = &fast->table[(addr >> TARGET_PAGE_BITS) &
+                                     (fast->mask >> CPU_TLB_ENTRY_BITS)];
+
+    /* SUBLEQ's guest ordering is TCG_MO_ALL; x86 TCG fences ST_LD
+     * immediately before each qemu_ld. This includes the first access
+     * following an earlier TB's store. */
+    if (after_ram_read) {
+        /* The immediately preceding access was an aligned direct-hit RAM
+         * load following smp_mb(): no intervening guest store, MMU helper,
+         * MMIO or instrumentation. On x86 WB RAM only LD_LD remains. Do
+         * not carry this proof across a store, slow access or helper call. */
+        smp_rmb();
+    } else {
+        smp_mb();
+    }
+#ifdef CONFIG_PLUGIN
+    if (unlikely(cs->neg.plugin_mem_cbs)) {
+        return cpu_ldl_le_mmuidx_ra(env, addr, 0, ra);
+    }
+#endif
+    if (likely(qatomic_read(&entry->addr_read) ==
+               (addr & (TARGET_PAGE_MASK | 3)))) {
+        if (was_ram_read) {
+            *was_ram_read = true;
+        }
+        return ldl_le_p((void *)(uintptr_t)(addr + entry->addend));
+    }
+    return cpu_ldl_le_mmuidx_ra(env, addr, 0, ra);
+}
+
+static inline uint32_t subleq_compact_ld(CPUSubleqState *env, uint32_t addr,
+                                         uintptr_t ra)
+{
+    return subleq_compact_load(env, addr, ra, false, NULL);
+}
+
+static inline uint32_t subleq_read_difference(CPUSubleqState *env, uint32_t a,
+                                              uint32_t b, uintptr_t ra, bool pair)
+{
+    bool direct = false;
+    uint32_t lhs = subleq_compact_load(env, b, ra, false, pair ? &direct : NULL);
+    return lhs - subleq_compact_load(env, a, ra, pair && direct, NULL);
+}
+
+static inline void subleq_compact_st(CPUSubleqState *env, uint32_t addr,
+                                     uint32_t value, uintptr_t ra)
+{
+    CPUState *cs = env_cpu(env);
+    CPUTLBDescFast *fast = cpu_tlb_fast(cs, 0);
+    CPUTLBEntry *entry = &fast->table[(addr >> TARGET_PAGE_BITS) &
+                                     (fast->mask >> CPU_TLB_ENTRY_BITS)];
+
+#ifdef CONFIG_PLUGIN
+    if (unlikely(cs->neg.plugin_mem_cbs)) {
+        cpu_stl_le_mmuidx_ra(env, addr, value, 0, ra);
+        return;
+    }
+#endif
+    if (likely(qatomic_read(&entry->addr_write) ==
+               (addr & (TARGET_PAGE_MASK | 3)))) {
+        stl_le_p((void *)(uintptr_t)(addr + entry->addend), value);
+    } else {
+        cpu_stl_le_mmuidx_ra(env, addr, value, 0, ra);
+    }
+}
+
+/* One shared checked body for decoded, direct, ordinary RAM triples.
+ * The translator retains tracked code fetches, insn_start, watchpoint
+ * fallback and static RAM bounds. No host address survives an access. */
+static inline void subleq_compact(CPUSubleqState *env, uint32_t a, uint32_t b,
+                                  uint32_t c, uint32_t pc, uintptr_t ra, bool pair)
+{
+    uint32_t result, handler;
+
+    result = subleq_read_difference(env, a, b, ra, pair);
+    subleq_compact_st(env, b, result, ra);
+    pc = (int32_t)result <= 0 ? c : pc + SUBLEQ_INSN_SIZE;
+    handler = subleq_compact_ld(env, SUBLEQ_IRQ_HANDLER, ra);
+    if (handler && env->timer++ > SUBLEQ_TIMER_THRESHOLD) {
+        pc = subleq_timer_irq(env, pc, handler, ra);
+    }
+    env->pc = pc;
+}
+
+/* Fallthrough and branch target coincide. Constant page index and alignment
+ * let the compiler simplify the existing checked accessors without assuming
+ * a hit, retaining a host pointer, or dropping either architectural read. */
+static inline void subleq_compact_low_seq(CPUSubleqState *env, uint32_t ab,
+                                          uint32_t next, uintptr_t ra, bool pair)
+{
+    uint32_t a = ab & 0xffc, b = (ab >> 12) & 0xffc;
+    uint32_t result = subleq_read_difference(env, a, b, ra, pair);
+    uint32_t handler;
+
+    subleq_compact_st(env, b, result, ra);
+    handler = subleq_compact_ld(env, SUBLEQ_IRQ_HANDLER, ra);
+    if (handler && env->timer++ > SUBLEQ_TIMER_THRESHOLD) {
+        next = subleq_timer_irq(env, next, handler, ra);
+    }
+    env->pc = next;
+}
+
+void HELPER(subleq_compact)(CPUSubleqState *env, uint32_t a, uint32_t b,
+                            uint32_t c, uint32_t pc)
+{
+    subleq_compact(env, a, b, c, pc, GETPC(), false);
+}
+
+void HELPER(subleq_compact_pair)(CPUSubleqState *env, uint32_t a, uint32_t b,
+                                 uint32_t c, uint32_t pc)
+{
+    subleq_compact(env, a, b, c, pc, GETPC(), true);
+}
+
+void HELPER(subleq_compact_low_seq)(CPUSubleqState *env, uint32_t ab,
+                                    uint32_t next)
+{
+    subleq_compact_low_seq(env, ab, next, GETPC(), false);
+}
+
+void HELPER(subleq_compact_pair_low_seq)(CPUSubleqState *env, uint32_t ab,
+                                         uint32_t next)
+{
+    subleq_compact_low_seq(env, ab, next, GETPC(), true);
 }
 
 void HELPER(subleq_step)(CPUSubleqState *env)
